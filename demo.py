@@ -8,7 +8,9 @@
   4) 重试：503 两次后成功（确定性退避）；
   5) 重试耗尽：持续 500 -> 死信，失败原因可查询；
   6) 顺序：同订阅内事件严格有序（队头阻塞）；
-  7) 租户隔离：A/B 额度与凭据互不影响。
+  7) 租户隔离：A/B 额度与凭据互不影响；
+  8) 暂停/恢复：暂停期间受理不投递，恢复后按原顺序续发；
+  9) 失败重放：单条/批量重放，重复触发只有一次真正生效。
 """
 from __future__ import annotations
 
@@ -194,6 +196,64 @@ async def main() -> None:
     r = await post(state, "tenant-a", "key-a-new", "secret-new",
                    _envelope("demo-a-ok"), start)
     print(f"   event=demo-a-ok tenant-a 仍可受理 -> accepted={r.accepted}")
+
+    print("\n" + "=" * 70)
+    print("8) 暂停/恢复：暂停期间受理不投递，恢复后按原顺序续发")
+    print("=" * 70)
+    state8 = AppState(seed=False)
+    await _setup_minimal_tenant(state8, start)
+    url8 = "mock://demo8/hook"
+    await make_sub(state8, "sub-demo8", url8)
+    await state8.dispatcher.pause_subscription("sub-demo8")
+    for eid in ("demo-p1", "demo-p2", "demo-p3"):
+        r = await post(state8, "tenant-a", "key-a-new", "secret-new",
+                       _envelope(eid), start)
+        assert r.accepted and r.status_code == 202
+    await state8.dispatcher.run_pending(now=start)
+    held = [c for c in state8.transport.calls if c["url"] == url8]
+    print(f"   暂停期间受理3个事件，实际发出={len(held)}（应为0）")
+    await state8.dispatcher.resume_subscription("sub-demo8")
+    now8 = await pump_cycles(state8, start)
+    order8 = [json.loads(c["body"])["event_id"]
+              for c in state8.transport.calls if c["url"] == url8]
+    print(f"   恢复后投递顺序={order8}（应为入队原序）")
+
+    print("\n" + "=" * 70)
+    print("9) 失败重放：死信 -> 重放成功；重复重放结论稳定可区分")
+    print("=" * 70)
+    from app.models import ReplayOutcome, InboundEvent
+    state9 = AppState(seed=False)
+    await _setup_minimal_tenant(state9, start)
+    url9 = "mock://demo9/hook"
+    sub9 = await make_sub(state9, "sub-demo9", url9, max_attempts=2)
+
+    async def to_dead(eid):
+        ev = InboundEvent(eid, "tenant-a", "order.created", "1.0.0",
+                          {"order_id": eid}, start)
+        await state9.storage.save_event_if_absent(ev)
+        await state9.dispatcher.enqueue(eid, sub9)
+        t = start
+        for _ in range(10):
+            await state9.dispatcher.run_pending(now=t)
+            rec = await state9.storage.get_delivery(eid, "sub-demo9")
+            if rec.status is EventStatus.DEAD_LETTER:
+                return rec
+            t += timedelta(milliseconds=60)
+        raise AssertionError(eid)
+
+    state9.transport.script(url9, [(500, "x")] * 2)
+    rec9 = await to_dead("demo-r1")
+    print(f"   event=demo-r1 原死信 reason={rec9.fail_reason.value}")
+    state9.transport.script(url9, [(200, "ok")])
+    o1, _ = await state9.dispatcher.replay_dead_letter("demo-r1", "sub-demo9")
+    o2, _ = await state9.dispatcher.replay_dead_letter("demo-r1", "sub-demo9")
+    print(f"   连续两次单条重放: {o1.value} / {o2.value}")
+    await pump_cycles(state9, start)
+    rec9b = await state9.storage.get_delivery("demo-r1", "sub-demo9")
+    o3, _ = await state9.dispatcher.replay_dead_letter("demo-r1", "sub-demo9")
+    print(f"   重放后状态={rec9b.status.value} 归档原因="
+          f"{rec9b.archived_fail_reason.value} 再次重放={o3.value}")
+
     print("\n演示完成。")
 
 

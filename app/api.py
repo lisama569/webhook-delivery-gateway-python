@@ -12,7 +12,9 @@ from app.models import (
     EventSchema,
     EventStatus,
     FieldSpec,
+    ReplayOutcome,
     Subscription,
+    SubscriptionState,
     Tenant,
     utcnow,
 )
@@ -196,6 +198,63 @@ async def put_subscription(tenant_id: str, body: SubscriptionIn):
 
 
 # ---------------------------------------------------------------------------
+# 订阅投递开关：暂停 / 恢复 / 状态（订阅粒度、幂等、不影响入站受理）
+# ---------------------------------------------------------------------------
+async def _require_subscription(tenant_id: str, subscription_id: str):
+    state = get_state()
+    sub = await state.storage.get_subscription(subscription_id)
+    if sub is None or sub.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    return state, sub
+
+
+@router.post("/admin/tenants/{tenant_id}/subscriptions/{subscription_id}/pause")
+async def pause_subscription(tenant_id: str, subscription_id: str):
+    state, sub = await _require_subscription(tenant_id, subscription_id)
+    new_state = await state.dispatcher.pause_subscription(subscription_id)
+    return {
+        "subscription_id": subscription_id,
+        "tenant_id": tenant_id,
+        "state": new_state.value,
+        "changed": new_state is SubscriptionState.PAUSED,
+    }
+
+
+@router.post("/admin/tenants/{tenant_id}/subscriptions/{subscription_id}/resume")
+async def resume_subscription(tenant_id: str, subscription_id: str):
+    state, sub = await _require_subscription(tenant_id, subscription_id)
+    new_state = await state.dispatcher.resume_subscription(subscription_id)
+    return {
+        "subscription_id": subscription_id,
+        "tenant_id": tenant_id,
+        "state": new_state.value,
+        "changed": new_state is SubscriptionState.ACTIVE,
+    }
+
+
+@router.get("/admin/tenants/{tenant_id}/subscriptions/{subscription_id}/state")
+async def get_subscription_state(tenant_id: str, subscription_id: str):
+    state, sub = await _require_subscription(tenant_id, subscription_id)
+    current = await state.dispatcher.subscription_state(subscription_id)
+    backlog = state.storage.list_deliveries(
+        tenant_id=tenant_id,
+    )
+    pending = [
+        r for r in backlog
+        if r.subscription_id == subscription_id
+        and r.status in (
+            EventStatus.SCHEDULED, EventStatus.DELIVERING, EventStatus.RETRYING,
+        )
+    ]
+    return {
+        "subscription_id": subscription_id,
+        "tenant_id": tenant_id,
+        "state": current.value,
+        "pending": len(pending),
+    }
+
+
+# ---------------------------------------------------------------------------
 # 可查询的失败链路与投递状态
 # ---------------------------------------------------------------------------
 def _delivery_dict(record: DeliveryRecord, tenant_id: str | None) -> dict:
@@ -209,6 +268,15 @@ def _delivery_dict(record: DeliveryRecord, tenant_id: str | None) -> dict:
         "fail_detail": record.fail_detail,
         "next_attempt_at": record.next_attempt_at.isoformat()
         if record.next_attempt_at
+        else None,
+        "replayed": record.replayed,
+        "replay_count": record.replay_count,
+        "archived_fail_reason": record.archived_fail_reason.value
+        if record.archived_fail_reason
+        else None,
+        "archived_fail_detail": record.archived_fail_detail,
+        "archived_at": record.archived_at.isoformat()
+        if record.archived_at
         else None,
         "attempts": [
             {
@@ -236,12 +304,60 @@ async def list_deliveries(tenant_id: str | None = None, status: str | None = Non
 @router.get("/admin/deliveries/dead-letter")
 async def list_dead_letters(tenant_id: str | None = None):
     state = get_state()
-    records = state.storage.list_deliveries(
-        tenant_id=tenant_id, status=EventStatus.DEAD_LETTER
-    )
+    records = state.storage.list_dead_letters(tenant_id=tenant_id)
     return [
         _delivery_dict(r, state.storage._delivery_tenant(r)) for r in records
     ]
+
+
+# ---------------------------------------------------------------------------
+# 失败重放：单条 / 按订阅批量（幂等、保序、并发安全）
+# ---------------------------------------------------------------------------
+_REPLAY_HTTP_STATUS = {
+    ReplayOutcome.REPLAYED: 202,
+    ReplayOutcome.ALREADY_REPLAYING: 200,
+    ReplayOutcome.NOT_DEAD_LETTER: 409,
+    ReplayOutcome.ALREADY_DELIVERED: 409,
+    ReplayOutcome.NOT_FOUND: 404,
+}
+
+
+@router.post(
+    "/admin/tenants/{tenant_id}/subscriptions/{subscription_id}"
+    "/events/{event_id}/replay"
+)
+async def replay_event(tenant_id: str, subscription_id: str, event_id: str):
+    state, sub = await _require_subscription(tenant_id, subscription_id)
+    outcome, record = await state.dispatcher.replay_dead_letter(
+        event_id, subscription_id
+    )
+    if outcome is ReplayOutcome.NOT_FOUND:
+        raise HTTPException(status_code=404, detail="delivery record not found")
+    return JSONResponse(
+        status_code=_REPLAY_HTTP_STATUS[outcome],
+        content={
+            "event_id": event_id,
+            "subscription_id": subscription_id,
+            "tenant_id": tenant_id,
+            "outcome": outcome.value,
+            "replayed": outcome is ReplayOutcome.REPLAYED,
+            "seq": record.seq if record else None,
+            "replay_count": record.replay_count if record else None,
+            "archived_fail_reason": record.archived_fail_reason.value
+            if record and record.archived_fail_reason else None,
+        },
+    )
+
+
+@router.post(
+    "/admin/tenants/{tenant_id}/subscriptions/{subscription_id}/replay-dead-letters"
+)
+async def replay_subscription_dead_letters(tenant_id: str, subscription_id: str):
+    state, sub = await _require_subscription(tenant_id, subscription_id)
+    summary = await state.dispatcher.replay_subscription_dead_letters(
+        tenant_id, subscription_id
+    )
+    return summary
 
 
 @router.get("/admin/tenants/{tenant_id}/events/{event_id}")

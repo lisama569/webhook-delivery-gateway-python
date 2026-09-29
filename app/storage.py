@@ -17,8 +17,10 @@ from app.models import (
     Credential,
     DeliveryRecord,
     EventSchema,
+    EventStatus,
     InboundEvent,
     Subscription,
+    SubscriptionState,
     Tenant,
 )
 from app.models import utcnow
@@ -56,6 +58,8 @@ class Storage:
         self._subscriptions: dict[str, Subscription] = {}
         self._events: dict[tuple[str, str], InboundEvent] = {}
         self._deliveries: dict[tuple[str, str], DeliveryRecord] = {}
+        # 订阅投递开关：subscription_id -> SubscriptionState（默认 ACTIVE）
+        self._subscription_states: dict[str, SubscriptionState] = {}
         # 并发原语
         self._event_locks: dict[tuple[str, str], _LazyLock] = {}
         self._subscription_locks: dict[str, _LazyLock] = {}
@@ -115,6 +119,17 @@ class Storage:
             if s.tenant_id == tenant_id and s.event_type == event_type
         ]
 
+    # subscription run-state (pause/resume) -------------------------------
+    async def set_subscription_state(
+        self, subscription_id: str, state: SubscriptionState
+    ) -> None:
+        self._subscription_states[subscription_id] = state
+
+    async def get_subscription_state(self, subscription_id: str) -> SubscriptionState:
+        return self._subscription_states.get(
+            subscription_id, SubscriptionState.ACTIVE
+        )
+
     # event ---------------------------------------------------------------
     async def event_lock(self, tenant_id: str, event_id: str) -> _LazyLock:
         key = (tenant_id, event_id)
@@ -153,6 +168,22 @@ class Storage:
             records = [r for r in records if self._delivery_tenant(r) == tenant_id]
         if status is not None:
             records = [r for r in records if r.status == status]
+        return sorted(records, key=lambda r: (r.subscription_id, r.seq))
+
+    def list_dead_letters(
+        self,
+        tenant_id: str | None = None,
+        subscription_id: str | None = None,
+    ) -> list[DeliveryRecord]:
+        """失败链路（DEAD_LETTER）查询；按 seq 排序保证重放顺序确定。"""
+        records = [
+            r for r in self._deliveries.values()
+            if r.status is EventStatus.DEAD_LETTER
+        ]
+        if tenant_id is not None:
+            records = [r for r in records if self._delivery_tenant(r) == tenant_id]
+        if subscription_id is not None:
+            records = [r for r in records if r.subscription_id == subscription_id]
         return sorted(records, key=lambda r: (r.subscription_id, r.seq))
 
     def _delivery_tenant(self, record: DeliveryRecord) -> str | None:

@@ -4,18 +4,28 @@
 """
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI
 
 from app import api
 from app.bootstrap import get_state
 
 
-def create_app() -> FastAPI:
-    app = FastAPI(title="Webhook Delivery Gateway")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # 预热默认状态（装配演示数据）并启动后台投递 worker：
+    # 服务正常运行后，投递与失败重试自动往前走。
+    state = get_state()
+    state.start_worker()
+    try:
+        yield
+    finally:
+        await state.stop_worker()
 
-    @app.on_event("startup")
-    async def _startup() -> None:
-        get_state()  # 预热默认状态（装配演示数据）
+
+def create_app() -> FastAPI:
+    app = FastAPI(title="Webhook Delivery Gateway", lifespan=lifespan)
 
     @app.get("/")
     def read_root():

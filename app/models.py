@@ -21,6 +21,21 @@ class EventStatus(str, Enum):
     DEAD_LETTER = "DEAD_LETTER"
 
 
+class SubscriptionState(str, Enum):
+    """订阅投递开关（运行态，不影响入站受理）。"""
+    ACTIVE = "ACTIVE"
+    PAUSED = "PAUSED"
+
+
+class ReplayOutcome(str, Enum):
+    """失败事件重放请求的稳定结论（并发/重复调用可区分）。"""
+    REPLAYED = "REPLAYED"                  # 本次请求生效，事件已重新排队
+    ALREADY_REPLAYING = "ALREADY_REPLAYING"  # 已被先前请求重放，正在投递中
+    NOT_DEAD_LETTER = "NOT_DEAD_LETTER"    # 事件当前不在失败链路
+    ALREADY_DELIVERED = "ALREADY_DELIVERED"  # 已成功投递，拒绝重发
+    NOT_FOUND = "NOT_FOUND"                # 投递记录不存在
+
+
 class FailReason(str, Enum):
     """可解释的失败/拒绝原因。"""
     NONE = "NONE"
@@ -36,6 +51,10 @@ class FailReason(str, Enum):
     HTTP_4XX = "HTTP_4XX"
     HTTP_5XX = "HTTP_5XX"
     ATTEMPTS_EXHAUSTED = "ATTEMPTS_EXHAUSTED"
+    # 出站凭据不可用：网关侧问题，与接收方返回的失败明确区分
+    CREDENTIAL_MISSING = "CREDENTIAL_MISSING"
+    CREDENTIAL_NOT_YET_VALID = "CREDENTIAL_NOT_YET_VALID"
+    CREDENTIAL_EXPIRED = "CREDENTIAL_EXPIRED"
 
 
 class DeliveryKind(str, Enum):
@@ -124,3 +143,9 @@ class DeliveryRecord:
     fail_detail: str = ""
     next_attempt_at: datetime | None = None
     seq: int = 0
+    # 失败重放归档：原死信结论保留可查，与新一轮尝试互不覆盖
+    replayed: bool = False
+    replay_count: int = 0
+    archived_fail_reason: FailReason | None = None
+    archived_fail_detail: str | None = None
+    archived_at: datetime | None = None

@@ -1,6 +1,7 @@
 """组装与本地演示数据装配；提供可重置的应用状态。"""
 from __future__ import annotations
 
+import asyncio
 from datetime import timedelta
 
 from app.dispatcher import Dispatcher
@@ -29,8 +30,31 @@ class AppState:
         self.transport = MockTransport()
         self.dispatcher = Dispatcher(self.storage, self.transport)
         self.service = InboundService(self.storage, self.dispatcher)
+        self._worker_task: asyncio.Task | None = None
         if seed:
             self.seed_demo_data()
+
+    def start_worker(self) -> None:
+        """启动后台投递 worker（正常运行时投递/重试自动推进）。"""
+        if self._worker_task is not None and not self._worker_task.done():
+            return
+
+        async def _run() -> None:
+            await self.dispatcher.run_forever()
+
+        self._worker_task = asyncio.create_task(_run())
+        logger.info("app_worker_started basis=LIFESPAN")
+
+    async def stop_worker(self) -> None:
+        if self._worker_task is None:
+            return
+        self._worker_task.cancel()
+        try:
+            await self._worker_task
+        except asyncio.CancelledError:
+            pass
+        self._worker_task = None
+        logger.info("app_worker_stopped basis=LIFESPAN")
 
     def seed_demo_data(self) -> None:
         import asyncio
@@ -44,12 +68,13 @@ class AppState:
                 Tenant("tenant-b", "合作方B（独立额度）", rate_limit_per_min=5)
             )
             # tenant-a 的新旧凭据处于轮换重叠期
+            # 窗口向过去放宽，确保固定时钟（如测试 T0）也落在有效期内
             await self.storage.upsert_credential(
                 Credential(
                     key_id="key-a-old",
                     tenant_id="tenant-a",
                     secret="secret-old",
-                    not_before=now - timedelta(days=30),
+                    not_before=now - timedelta(days=90),
                     not_after=now + timedelta(days=1),
                     deprecated=True,
                 )
@@ -59,18 +84,18 @@ class AppState:
                     key_id="key-a-new",
                     tenant_id="tenant-a",
                     secret="secret-new",
-                    not_before=now - timedelta(days=1),
+                    not_before=now - timedelta(days=10),
                     not_after=now + timedelta(days=29),
                 )
             )
-            # 已过期凭据：必须被明确拒绝
+            # 已过期凭据：必须被明确拒绝（not_after 早于任何本地验证时钟）
             await self.storage.upsert_credential(
                 Credential(
                     key_id="key-a-expired",
                     tenant_id="tenant-a",
                     secret="secret-expired",
-                    not_before=now - timedelta(days=60),
-                    not_after=now - timedelta(days=1),
+                    not_before=now - timedelta(days=70),
+                    not_after=now - timedelta(days=10),
                 )
             )
             await self.storage.upsert_credential(
@@ -78,7 +103,7 @@ class AppState:
                     key_id="key-b-1",
                     tenant_id="tenant-b",
                     secret="secret-b",
-                    not_before=now - timedelta(days=1),
+                    not_before=now - timedelta(days=10),
                     not_after=now + timedelta(days=30),
                 )
             )
@@ -147,5 +172,8 @@ def get_state() -> AppState:
 
 def reset_state(seed: bool = True) -> AppState:
     global _state
+    old = _state
     _state = AppState(seed=seed)
+    if old is not None and old._worker_task is not None and not old._worker_task.done():
+        old._worker_task.cancel()
     return _state
