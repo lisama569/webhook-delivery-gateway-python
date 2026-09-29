@@ -146,11 +146,16 @@ class Storage:
         return self._deliveries.get((event_id, subscription_id))
 
     def list_deliveries(
-        self, tenant_id: str | None = None, status=None
+        self,
+        tenant_id: str | None = None,
+        status=None,
+        subscription_id: str | None = None,
     ) -> list[DeliveryRecord]:
         records = list(self._deliveries.values())
         if tenant_id is not None:
             records = [r for r in records if self._delivery_tenant(r) == tenant_id]
+        if subscription_id is not None:
+            records = [r for r in records if r.subscription_id == subscription_id]
         if status is not None:
             records = [r for r in records if r.status == status]
         return sorted(records, key=lambda r: (r.subscription_id, r.seq))

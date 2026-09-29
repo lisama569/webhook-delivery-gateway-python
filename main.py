@@ -15,7 +15,13 @@ def create_app() -> FastAPI:
 
     @app.on_event("startup")
     async def _startup() -> None:
-        get_state()  # 预热默认状态（装配演示数据）
+        state = get_state()  # 预热默认状态（装配演示数据）
+        # 正常运行时投递与失败重试自动推进，无需手工 pump。
+        state.dispatcher.start_worker()
+
+    @app.on_event("shutdown")
+    async def _shutdown() -> None:
+        await get_state().dispatcher.stop_worker()
 
     @app.get("/")
     def read_root():

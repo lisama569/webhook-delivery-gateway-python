@@ -1,5 +1,5 @@
 """出站投递：退避重试、重试耗尽死信（原因可区分）、订阅内顺序保证。"""
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 import pytest
 
@@ -11,7 +11,8 @@ from app.models import (
     utcnow,
 )
 
-T0 = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
+# 与种子/测试内凭据的有效期装配保持同一时钟基准（凭据按 utcnow() 装配）。
+T0 = utcnow()
 
 
 async def _enqueue_event(state, event_id, sub, payload=None):

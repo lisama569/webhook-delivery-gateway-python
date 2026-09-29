@@ -66,3 +66,21 @@ def test_tampered_body_signature_mismatch():
 def test_unknown_key_rejected():
     ok, basis, _ = verify_signature(_creds(), "ghost", TS, BODY, "ab", now=NOW)
     assert not ok and basis == "KEY_NOT_FOUND"
+
+
+def test_outbound_credential_window_uses_same_rules():
+    """出站凭据窗口判定与入站验签同一套 not_before/not_after/轮换规则。"""
+    from app.security import credential_window_basis
+
+    creds = {c.key_id: c for c in _creds()}
+    print(f"\n[cred-window] 缺失={credential_window_basis(None, NOW)} "
+          f"未生效={credential_window_basis(creds['future'], NOW)} "
+          f"已过期={credential_window_basis(creds['expired'], NOW)} "
+          f"新={credential_window_basis(creds['new'], NOW)} "
+          f"旧(deprecated,窗口内)={credential_window_basis(creds['old'], NOW)}")
+    assert credential_window_basis(None, NOW) == "KEY_NOT_FOUND"
+    assert credential_window_basis(creds["future"], NOW) == "CREDENTIAL_NOT_YET_VALID"
+    assert credential_window_basis(creds["expired"], NOW) == "EXPIRED_CREDENTIAL"
+    # 轮换宽限：deprecated 但仍在窗口内仍然可用
+    assert credential_window_basis(creds["old"], NOW) == "OK"
+    assert credential_window_basis(creds["new"], NOW) == "OK"

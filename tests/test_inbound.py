@@ -1,6 +1,4 @@
 """入站认证、租户隔离、配额、未知版本/字段的端到端受理判定。"""
-from datetime import datetime, timedelta, timezone
-
 import pytest
 
 from app.bootstrap import reset_state
@@ -11,10 +9,13 @@ from app.models import (
     FailReason,
     Subscription,
     Tenant,
+    utcnow,
 )
 from tests.helpers import build_event, raw_body, signed_headers
 
-T0 = datetime(2026, 9, 22, 12, 0, 0, tzinfo=timezone.utc)
+# 种子凭据按真实时间装配（见 bootstrap.seed_demo_data），因此判定时钟也锚定
+# 当前时刻，避免固定日期随时间漂移导致凭据窗口失配。
+T0 = utcnow()
 
 
 async def _accept(state, body, secret, key_id, tenant_id="tenant-a", now=T0):

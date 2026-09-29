@@ -8,7 +8,10 @@
   4) 重试：503 两次后成功（确定性退避）；
   5) 重试耗尽：持续 500 -> 死信，失败原因可查询；
   6) 顺序：同订阅内事件严格有序（队头阻塞）；
-  7) 租户隔离：A/B 额度与凭据互不影响。
+  7) 租户隔离：A/B 额度与凭据互不影响；
+  8) 暂停/恢复：暂停期间受理但不发出，恢复后按原顺序补发；
+  9) 死信重放：单条/批量重放顺序、并发幂等、凭据失窗与对方失败可区分；
+  10) 自走投递：服务启动后 worker 自动推进，无需手工 pump。
 """
 from __future__ import annotations
 
@@ -194,6 +197,114 @@ async def main() -> None:
     r = await post(state, "tenant-a", "key-a-new", "secret-new",
                    _envelope("demo-a-ok"), start)
     print(f"   event=demo-a-ok tenant-a 仍可受理 -> accepted={r.accepted}")
+
+    print("\n" + "=" * 70)
+    print("8) 暂停/恢复：暂停期间受理但不发出，恢复后按原 seq 顺序补发")
+    print("=" * 70)
+    state8 = AppState(seed=False)
+    await _setup_minimal_tenant(state8, start)
+    url8 = "mock://demo8/order"
+    sub8 = await make_sub(state8, "sub-demo8", url8, max_attempts=2)
+    await state8.dispatcher.pause_subscription("sub-demo8", now=start)
+    await post(state8, "tenant-a", "key-a-new", "secret-new",
+               _envelope("demo8-a"), start)
+    await post(state8, "tenant-a", "key-a-new", "secret-new",
+               _envelope("demo8-b"), start)
+    now = start
+    for _ in range(5):
+        await state8.dispatcher.run_pending(now=now)
+        now += timedelta(milliseconds=60)
+    print(f"   暂停期间实际发出请求数={len(state8.transport.calls)}（应为 0）")
+    await state8.dispatcher.resume_subscription("sub-demo8", now=now)
+    for _ in range(8):
+        await state8.dispatcher.run_pending(now=now)
+        now += timedelta(milliseconds=60)
+    order8 = [json.loads(c["body"])["event_id"] for c in state8.transport.calls]
+    print(f"   恢复后发送顺序={order8}（严格 a 先 b 后）")
+
+    print("\n" + "=" * 70)
+    print("9) 死信重放：耗尽后单条/批量重放，凭据失窗与对方失败原因可区分")
+    print("=" * 70)
+    state9 = AppState(seed=False)
+    await _setup_minimal_tenant(state9, start)
+    url9 = "mock://demo9/order"
+    await make_sub(state9, "sub-demo9", url9, max_attempts=2)
+    state9.transport.script(url9, [(500, "x"), (500, "x"), (500, "x"), (500, "x")])
+    await post(state9, "tenant-a", "key-a-new", "secret-new",
+               _envelope("demo9-a"), start)
+    await post(state9, "tenant-a", "key-a-new", "secret-new",
+               _envelope("demo9-b"), start)
+    for _ in range(12):
+        await state9.dispatcher.run_pending(now=now)
+        now += timedelta(milliseconds=60)
+    dlq9 = state9.storage.list_deliveries(
+        subscription_id="sub-demo9", status=EventStatus.DEAD_LETTER)
+    print(f"   死信 {[r.event_id for r in dlq9]}，原因={dlq9[0].fail_reason.value}")
+
+    # 并发重放同一条：仅一次生效
+    barrier9 = asyncio.Barrier(4)
+
+    async def replay9():
+        async with barrier9:
+            return await state9.dispatcher.replay_one("sub-demo9", "demo9-a", now=now)
+
+    rr = await asyncio.gather(*(replay9() for _ in range(4)))
+    print(f"   demo9-a 并发 4 次重放结论={[r.outcome.value for r in rr]}")
+
+    # 批量重放（含上面已在途的 a 与另一条 b），接收方恢复
+    state9.transport.script(url9, [(200, "ok"), (200, "ok"), (200, "ok")])
+    _, batch = await state9.dispatcher.replay_subscription_dead_letters(
+        "sub-demo9", now=now)
+    print(f"   批量重放结论={[(r.event_id, r.outcome.value) for r in batch]}")
+    for _ in range(10):
+        await state9.dispatcher.run_pending(now=now)
+        now += timedelta(milliseconds=60)
+    finals = {eid: (await state9.storage.get_delivery(eid, "sub-demo9")).status.value
+              for eid in ("demo9-a", "demo9-b")}
+    print(f"   重放后最终状态={finals}")
+
+    # 凭据已过期：请求不发出，直接死信，原因与接收方失败严格区分
+    from app.models import Credential as _Cred, InboundEvent as _IEvt
+    await state9.storage.upsert_credential(_Cred(
+        "key-9-expired", "tenant-a", "secret-9-exp",
+        start - timedelta(days=60), start - timedelta(days=1)))
+    sub_bad = Subscription("sub-demo9-bad", "tenant-a", "order.created", "1.0.0",
+                           "mock://demo9/bad", "key-9-expired", max_attempts=2)
+    await state9.storage.upsert_subscription(sub_bad)
+    ev_bad = _IEvt("demo9-cred", "tenant-a", "order.created", "1.0.0",
+                   {"order_id": "demo9-cred"}, start)
+    await state9.storage.save_event_if_absent(ev_bad)
+    await state9.dispatcher.enqueue("demo9-cred", sub_bad)
+    await state9.dispatcher.run_pending(now=now)
+    rec_bad = await state9.storage.get_delivery("demo9-cred", "sub-demo9-bad")
+    sent_bad = [c for c in state9.transport.calls if c["url"] == "mock://demo9/bad"]
+    print(f"   demo9-cred 凭据失窗 状态={rec_bad.status.value} "
+          f"reason={rec_bad.fail_reason.value} 实际发出={len(sent_bad)} "
+          f"attempts={len(rec_bad.attempts)}（请求未发出，可与对方 500 区分）")
+
+    print("\n" + "=" * 70)
+    print("10) 自走投递：start_worker 后自动成功/重试/死信，无需 pump")
+    print("=" * 70)
+    state10 = AppState(seed=False)
+    await _setup_minimal_tenant(state10, start)
+    url10 = "mock://demo10/order"
+    await make_sub(state10, "sub-demo10", url10, max_attempts=2)
+    state10.transport.script(url10, [(503, "busy"), (200, "ok")])
+    state10.dispatcher.start_worker()
+    try:
+        await post(state10, "tenant-a", "key-a-new", "secret-new",
+                   _envelope("demo10-a"), start)
+        rec10 = None
+        for _ in range(100):
+            rec10 = await state10.storage.get_delivery("demo10-a", "sub-demo10")
+            if rec10.status in (EventStatus.DELIVERED, EventStatus.DEAD_LETTER):
+                break
+            await asyncio.sleep(0.02)
+        print(f"   worker 自走最终={rec10.status.value} "
+              f"尝试={[a.http_status for a in rec10.attempts]}（全程无 pump）")
+    finally:
+        await state10.dispatcher.stop_worker()
+
     print("\n演示完成。")
 
 

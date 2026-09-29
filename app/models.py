@@ -36,6 +36,9 @@ class FailReason(str, Enum):
     HTTP_4XX = "HTTP_4XX"
     HTTP_5XX = "HTTP_5XX"
     ATTEMPTS_EXHAUSTED = "ATTEMPTS_EXHAUSTED"
+    # 出站侧凭据问题（与接收方返回失败严格区分）：凭据缺失/未生效/已过期，
+    # 请求根本没有发出，故不进入退避重试，直接进入死信链路等待处理（换凭据/重放）。
+    CREDENTIAL_UNAVAILABLE = "CREDENTIAL_UNAVAILABLE"
 
 
 class DeliveryKind(str, Enum):
@@ -87,6 +90,9 @@ class Subscription:
     callback_url: str
     credential_key_id: str  # 出站签名使用的凭据
     max_attempts: int = 4
+    # 运维开关：暂停期间新事件照常入队但不投递；恢复后按原 seq 顺序补发。
+    paused: bool = False
+    paused_at: datetime | None = None
 
 
 @dataclass
@@ -124,3 +130,10 @@ class DeliveryRecord:
     fail_detail: str = ""
     next_attempt_at: datetime | None = None
     seq: int = 0
+    # 重放代次：首次投递为 0；每发起一次有效重放 +1。attempts 仅保留当代次的
+    # 尝试历史，历史代次归档到 previous_attempts，全程可审计。
+    replay_generation: int = 0
+    previous_attempts: list[DeliveryAttempt] = field(default_factory=list)
+    # 重放占用标记：对同一条失败事件并发/连续多次重放，只有一次真正生效，
+    # 其余请求拿到稳定且可区分的结论。记录最近一次使其进入占用态的重放代次。
+    replay_in_flight: bool = False

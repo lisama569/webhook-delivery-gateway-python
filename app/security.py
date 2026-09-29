@@ -37,6 +37,25 @@ def sign(secret: str, timestamp: str, body: bytes) -> str:
     return digest.hexdigest()
 
 
+def credential_window_basis(cred: Credential | None, now: datetime | None = None) -> str:
+    """出站凭据是否处于可用窗口，返回机器可读判定依据。
+
+    与入站验签遵守完全相同的有效期/轮换规则：
+    - cred is None                         -> KEY_NOT_FOUND
+    - now < not_before                     -> CREDENTIAL_NOT_YET_VALID
+    - now > not_after（含已轮换下线）       -> EXPIRED_CREDENTIAL
+    - 窗口内（即使 deprecated=True）        -> OK（弃用宽限，仍可用）
+    """
+    now = now or utcnow()
+    if cred is None:
+        return "KEY_NOT_FOUND"
+    if now < cred.not_before:
+        return "CREDENTIAL_NOT_YET_VALID"
+    if now > cred.not_after:
+        return "EXPIRED_CREDENTIAL"
+    return "OK"
+
+
 def verify_signature(
     creds: list[Credential],
     key_id: str,

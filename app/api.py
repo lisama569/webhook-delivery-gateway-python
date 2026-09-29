@@ -195,6 +195,53 @@ async def put_subscription(tenant_id: str, body: SubscriptionIn):
     return {"subscription_id": body.subscription_id, "tenant_id": tenant_id}
 
 
+def _subscription_dict(sub: Subscription) -> dict:
+    return {
+        "subscription_id": sub.subscription_id,
+        "tenant_id": sub.tenant_id,
+        "event_type": sub.event_type,
+        "version": sub.version,
+        "callback_url": sub.callback_url,
+        "credential_key_id": sub.credential_key_id,
+        "max_attempts": sub.max_attempts,
+        "paused": sub.paused,
+        "paused_at": sub.paused_at.isoformat() if sub.paused_at else None,
+    }
+
+
+@router.get("/admin/tenants/{tenant_id}/subscriptions/{subscription_id}")
+async def get_subscription(tenant_id: str, subscription_id: str):
+    state = get_state()
+    sub = await state.storage.get_subscription(subscription_id)
+    if sub is None or sub.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    return _subscription_dict(sub)
+
+
+@router.post("/admin/tenants/{tenant_id}/subscriptions/{subscription_id}/pause")
+async def pause_subscription(tenant_id: str, subscription_id: str):
+    """暂停订阅投递（事件照常受理入队）。重复调用结论稳定。"""
+    state = get_state()
+    sub = await state.storage.get_subscription(subscription_id)
+    if sub is None or sub.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    sub = await state.dispatcher.pause_subscription(subscription_id)
+    return {"subscription_id": subscription_id, "paused": True,
+            "subscription": _subscription_dict(sub)}
+
+
+@router.post("/admin/tenants/{tenant_id}/subscriptions/{subscription_id}/resume")
+async def resume_subscription(tenant_id: str, subscription_id: str):
+    """恢复订阅投递：从队首起按原顺序补发。重复调用结论稳定。"""
+    state = get_state()
+    sub = await state.storage.get_subscription(subscription_id)
+    if sub is None or sub.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    sub = await state.dispatcher.resume_subscription(subscription_id)
+    return {"subscription_id": subscription_id, "paused": False,
+            "subscription": _subscription_dict(sub)}
+
+
 # ---------------------------------------------------------------------------
 # 可查询的失败链路与投递状态
 # ---------------------------------------------------------------------------
@@ -210,6 +257,9 @@ def _delivery_dict(record: DeliveryRecord, tenant_id: str | None) -> dict:
         "next_attempt_at": record.next_attempt_at.isoformat()
         if record.next_attempt_at
         else None,
+        "replay_generation": record.replay_generation,
+        "replay_in_flight": record.replay_in_flight,
+        "archived_attempt_generations": len(record.previous_attempts),
         "attempts": [
             {
                 "attempt": a.attempt,
@@ -242,6 +292,82 @@ async def list_dead_letters(tenant_id: str | None = None):
     return [
         _delivery_dict(r, state.storage._delivery_tenant(r)) for r in records
     ]
+
+
+# ---------------------------------------------------------------------------
+# 失败链路重放：单条 / 按订阅批量（顺序、幂等、并发安全由 dispatcher 保证）
+# ---------------------------------------------------------------------------
+_REPLAY_HTTP_STATUS = {
+    "REPLAYED": 202,
+    "ALREADY_IN_FLIGHT": 200,
+    "NOT_DEAD_LETTER": 409,
+    "NOT_FOUND": 404,
+}
+
+
+def _replay_dict(result, tenant_id: str | None) -> dict:
+    return {
+        "event_id": result.event_id,
+        "subscription_id": result.subscription_id,
+        "tenant_id": tenant_id,
+        "outcome": result.outcome.value,
+        "replay_generation": result.generation,
+        "detail": result.detail,
+    }
+
+
+@router.post("/admin/tenants/{tenant_id}/subscriptions/{subscription_id}/"
+             "dead-letter/{event_id}/replay")
+async def replay_dead_letter(tenant_id: str, subscription_id: str, event_id: str):
+    """对单条失败事件发起重放。
+
+    202 REPLAYED=本次生效；200 ALREADY_IN_FLIGHT=重复触发（已有在途重放）；
+    409 NOT_DEAD_LETTER=事件不在失败链路（含已成功，不允许再发）；404=不存在。
+    """
+    state = get_state()
+    sub = await state.storage.get_subscription(subscription_id)
+    if sub is None or sub.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    result = await state.dispatcher.replay_one(subscription_id, event_id)
+    status_code = _REPLAY_HTTP_STATUS[result.outcome.value]
+    if result.outcome.value == "NOT_FOUND":
+        raise HTTPException(
+            status_code=404,
+            detail={"outcome": "NOT_FOUND", "detail": result.detail},
+        )
+    return JSONResponse(
+        status_code=status_code, content=_replay_dict(result, tenant_id)
+    )
+
+
+@router.post("/admin/tenants/{tenant_id}/subscriptions/{subscription_id}/"
+             "dead-letter/replay")
+async def replay_subscription_dead_letters(tenant_id: str, subscription_id: str):
+    """批量重放该订阅下所有尚未处理好的失败事件（严格按 seq 顺序逐条处理）。"""
+    state = get_state()
+    sub = await state.storage.get_subscription(subscription_id)
+    if sub is None or sub.tenant_id != tenant_id:
+        raise HTTPException(status_code=404, detail="subscription not found")
+    _, results = await state.dispatcher.replay_subscription_dead_letters(
+        subscription_id
+    )
+    return {
+        "subscription_id": subscription_id,
+        "tenant_id": tenant_id,
+        "total": len(results),
+        "replayed": [
+            _replay_dict(r, tenant_id)
+            for r in results if r.outcome.value == "REPLAYED"
+        ],
+        "already_in_flight": [
+            _replay_dict(r, tenant_id)
+            for r in results if r.outcome.value == "ALREADY_IN_FLIGHT"
+        ],
+        "not_dead_letter": [
+            _replay_dict(r, tenant_id)
+            for r in results if r.outcome.value == "NOT_DEAD_LETTER"
+        ],
+    }
 
 
 @router.get("/admin/tenants/{tenant_id}/events/{event_id}")
