@@ -69,13 +69,16 @@ class AppState:
             )
             # tenant-a 的新旧凭据处于轮换重叠期
             # 窗口向过去放宽，确保固定时钟（如测试 T0）也落在有效期内
+            # 窗口向过去充分放宽，确保固定时钟（如测试 T0，可能早于今天
+            # 数天/数十天）也落在有效期内；过期凭据则必须对任何本地验证时钟
+            # （固定 T0 与真实 now）都已过期。
             await self.storage.upsert_credential(
                 Credential(
                     key_id="key-a-old",
                     tenant_id="tenant-a",
                     secret="secret-old",
-                    not_before=now - timedelta(days=90),
-                    not_after=now + timedelta(days=1),
+                    not_before=now - timedelta(days=180),
+                    not_after=now + timedelta(days=2),
                     deprecated=True,
                 )
             )
@@ -84,7 +87,7 @@ class AppState:
                     key_id="key-a-new",
                     tenant_id="tenant-a",
                     secret="secret-new",
-                    not_before=now - timedelta(days=10),
+                    not_before=now - timedelta(days=20),
                     not_after=now + timedelta(days=29),
                 )
             )
@@ -94,8 +97,8 @@ class AppState:
                     key_id="key-a-expired",
                     tenant_id="tenant-a",
                     secret="secret-expired",
-                    not_before=now - timedelta(days=70),
-                    not_after=now - timedelta(days=10),
+                    not_before=now - timedelta(days=120),
+                    not_after=now - timedelta(days=30),
                 )
             )
             await self.storage.upsert_credential(
@@ -103,7 +106,7 @@ class AppState:
                     key_id="key-b-1",
                     tenant_id="tenant-b",
                     secret="secret-b",
-                    not_before=now - timedelta(days=10),
+                    not_before=now - timedelta(days=20),
                     not_after=now + timedelta(days=30),
                 )
             )
