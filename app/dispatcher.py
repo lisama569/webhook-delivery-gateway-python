@@ -40,9 +40,15 @@ logger = get_logger(__name__)
 BASE_BACKOFF_SECONDS = 0.05  # 本地验证用小基数
 MAX_BACKOFF_SECONDS = 1.0
 WORKER_POLL_SECONDS = 0.02  # 后台 worker 轮询节拍（到期才真正投递）
-# 批量重放代际去重冷却窗：该窗口内对同一批死信的重复批量请求，逐条返回
-# ALREADY_REPLAYING 而不重复认领（覆盖并发与紧随其后的连续触发）。
-BATCH_REPLAY_COOLDOWN_SECONDS = 5.0
+# 批量重放代际去重的默认冷却窗。语义：
+# - None（默认）：代际候选不过期——重复/边界场景下批量结论永远与事件真实
+#   状态对得上（暂停积压、已成功等场景连续调用结论与总数稳定一致）；
+# - 显式传 0：完全不读/不写代际候选（仅测试用，模拟"全新一轮"）；
+# - 显式传正数：该秒数后代际候选失效。
+# 真正能否重放始终以事件**当前真实状态**为准：只要事件再次落入
+# DEAD_LETTER（重放后又失败），无论距上次操作多久都可以再次重放，
+# 不会被当成"正在重放"卡住。
+BATCH_REPLAY_COOLDOWN_SECONDS: float | None = None
 
 
 def compute_backoff(attempt: int, base: float = BASE_BACKOFF_SECONDS) -> float:
@@ -81,7 +87,8 @@ class Dispatcher:
         self._queues: dict[str, deque[tuple[str, str]]] = {}
         self._cond = asyncio.Condition()
         # 并发/连续批量重放去重：subscription_id -> 上一代批量的
-        # (候选event_ids, 认领时刻)。冷却窗内重复批量请求识别为落败。
+        # (候选event_ids, 认领时刻)。候选 = 当代死信 ∪ 上代候选，因此重复
+        # 批量调用对每条事件都能给出与真实状态一致、可区分的逐条结论。
         self._batch_last: dict[str, tuple[list[str], object]] = {}
 
     # 入队 ----------------------------------------------------------------
@@ -151,64 +158,92 @@ class Dispatcher:
         now = now or utcnow()
         lock = await self._storage.subscription_lock(subscription_id)
         async with lock:
-            record = await self._storage.get_delivery(event_id, subscription_id)
-            if record is None:
-                logger.info(
-                    "replay_reject event_id=%s subscription_id=%s basis=NOT_FOUND",
-                    event_id, subscription_id,
-                )
-                return ReplayOutcome.NOT_FOUND, None
-            if record.status is EventStatus.DELIVERED:
-                return ReplayOutcome.ALREADY_DELIVERED, record
-            if record.status is not EventStatus.DEAD_LETTER:
-                # SCHEDULED/DELIVERING/RETRYING：已在投递链路中（多半是
-                # 先前一次重放已生效）
-                return ReplayOutcome.ALREADY_REPLAYING, record
+            return await self._replay_claim_locked(event_id, subscription_id, now)
 
-            # 归档原死信结论，重置投递状态
-            record.archived_fail_reason = record.fail_reason
-            record.archived_fail_detail = record.fail_detail
-            record.archived_at = now
-            record.replayed = True
-            record.replay_count += 1
-            record.status = EventStatus.SCHEDULED
-            record.fail_reason = FailReason.NONE
-            record.fail_detail = ""
-            record.next_attempt_at = None
-            record.attempts = []
-            await self._storage.save_delivery(record)
+    async def _replay_claim_locked(
+        self, event_id: str, subscription_id: str, now
+    ) -> tuple[ReplayOutcome, DeliveryRecord | None]:
+        """判定+认领+排队，调用方必须已持有该订阅锁。
 
-            async with self._cond:
-                queue = self._queues.setdefault(subscription_id, deque())
-                marker = (event_id, subscription_id)
-                if marker not in queue:
-                    queue.append(marker)
-                self._cond.notify_all()
+        结论完全以事件**当前真实状态**为准——即使它曾被上一代批量认领过，
+        只要此刻又是 DEAD_LETTER（重放后再次失败），就可以再次生效重放，
+        不会被时间窗或代际标记永久卡住。
+        """
+        record = await self._storage.get_delivery(event_id, subscription_id)
+        if record is None:
             logger.info(
-                "replay_accepted event_id=%s subscription_id=%s seq=%s "
-                "replay_count=%s archived_reason=%s",
-                event_id, subscription_id, record.seq, record.replay_count,
-                record.archived_fail_reason.value
-                if record.archived_fail_reason else None,
+                "replay_reject event_id=%s subscription_id=%s basis=NOT_FOUND",
+                event_id, subscription_id,
             )
-            return ReplayOutcome.REPLAYED, record
+            return ReplayOutcome.NOT_FOUND, None
+        if record.status is EventStatus.DELIVERED:
+            logger.info(
+                "replay_reject event_id=%s subscription_id=%s "
+                "basis=ALREADY_DELIVERED",
+                event_id, subscription_id,
+            )
+            return ReplayOutcome.ALREADY_DELIVERED, record
+        if record.status is not EventStatus.DEAD_LETTER:
+            # SCHEDULED/DELIVERING/RETRYING：已在投递链路中（多半是
+            # 先前一次重放已生效）
+            logger.info(
+                "replay_reject event_id=%s subscription_id=%s "
+                "basis=ALREADY_REPLAYING status=%s",
+                event_id, subscription_id, record.status.value,
+            )
+            return ReplayOutcome.ALREADY_REPLAYING, record
+
+        # 归档原死信结论，重置投递状态
+        record.archived_fail_reason = record.fail_reason
+        record.archived_fail_detail = record.fail_detail
+        record.archived_at = now
+        record.replayed = True
+        record.replay_count += 1
+        record.status = EventStatus.SCHEDULED
+        record.fail_reason = FailReason.NONE
+        record.fail_detail = ""
+        record.next_attempt_at = None
+        record.attempts = []
+        await self._storage.save_delivery(record)
+
+        async with self._cond:
+            queue = self._queues.setdefault(subscription_id, deque())
+            marker = (event_id, subscription_id)
+            if marker not in queue:
+                queue.append(marker)
+            self._cond.notify_all()
+        logger.info(
+            "replay_accepted event_id=%s subscription_id=%s seq=%s "
+            "replay_count=%s archived_reason=%s",
+            event_id, subscription_id, record.seq, record.replay_count,
+            record.archived_fail_reason.value
+            if record.archived_fail_reason else None,
+        )
+        return ReplayOutcome.REPLAYED, record
 
     async def replay_subscription_dead_letters(
         self, tenant_id: str, subscription_id: str, now=None,
-        cooldown_seconds: float = BATCH_REPLAY_COOLDOWN_SECONDS,
+        cooldown_seconds: float | None = BATCH_REPLAY_COOLDOWN_SECONDS,
     ) -> dict:
         """批量重放某订阅下所有仍在失败链路中的事件。
 
-        - 按 seq 升序逐条、在各自订阅锁内处理，保证顺序、天然反压（不会
-          一次性压垮服务）；
-        - 同一批事件并发或连续触发多次：只有一次真正重排，其余请求对每条
-          给出稳定可区分的 ALREADY_REPLAYING（代际冷却窗去重，见
-          BATCH_REPLAY_COOLDOWN_SECONDS）；
-        - 已成功的不重发；冷却窗之后若事件再次落入死信，视为新一轮，可再
-          次批量重放。
+        结论与事件**当前真实状态**严格对齐，重复/并发/连续调用稳定一致：
+
+        - 候选集合 = 当代仍在失败链路（DEAD_LETTER）的事件 ∪ 上一代批量
+          候选（未过期时）。因此同一批重复触发时，每条事件都拿到逐条结论，
+          不会这次有逐条结论、下次返回空结果或 total 对不上；
+        - 逐条在订阅锁内判定：当前 DEAD_LETTER -> 本次真正认领重排
+          （REPLAYED）；SCHEDULED/DELIVERING/RETRYING -> ALREADY_REPLAYING；
+          DELIVERED -> ALREADY_DELIVERED；记录消失则跳过（NOT_FOUND 不计入）；
+        - 整个「判定+认领+排队」在同一把订阅锁内按 seq 升序完成：并发两批
+          只有一批真正重排，另一批逐条落败，天然保序且形成反压；
+        - 重放后再次失败回到 DEAD_LETTER 的事件，无论距上次操作多久都能
+          再次 REPLAYED——代际候选只是「保证重复批次能逐条回带结论」的
+          记忆，从不阻止真实死信被重新认领；
+        - cooldown_seconds=None 时代际记忆不过期；=0 时完全不读不写
+          （"全新一轮"语义，无死信即空结果）；正数为有限冷却秒数。
         """
         now = now or utcnow()
-        sub = await self._storage.get_subscription(subscription_id)
         empty = {
             "tenant_id": tenant_id,
             "subscription_id": subscription_id,
@@ -220,71 +255,83 @@ class Dispatcher:
             "not_dead_letter": 0,
             "results": [],
         }
+        sub = await self._storage.get_subscription(subscription_id)
         if sub is None or sub.tenant_id != tenant_id:
             return empty
 
-        results: list[dict] = []
-        counts = {
-            "replayed": 0,
-            "already_replaying": 0,
-            "already_delivered": 0,
-            "not_dead_letter": 0,
-        }
-
         lock = await self._storage.subscription_lock(subscription_id)
         async with lock:
-            current = [
-                r.event_id
-                for r in self._storage.list_dead_letters(
-                    tenant_id=tenant_id, subscription_id=subscription_id
-                )
-            ]
-            last = self._batch_last.get(subscription_id)
-            recent_ids: list[str] = []
-            if last is not None:
-                last_ids, last_at = last
-                if (now - last_at).total_seconds() <= cooldown_seconds:
-                    recent_ids = list(last_ids)
-            recent_set = set(recent_ids)
-            # 仍死信且不在上一代冷却候选内 -> 本次真正认领；仍死信但刚被
-            # 上一代认领过 -> 稳定落败 ALREADY_REPLAYING（不重复认领）。
-            fresh = [eid for eid in current if eid not in recent_set]
-            claimed = [eid for eid in current if eid in recent_set]
-            if fresh:
-                # 登记本代候选与认领时刻，供并发/紧随其后的批次去重
-                self._batch_last[subscription_id] = (list(fresh), now)
-
-        for event_id in fresh:
-            outcome, _ = await self.replay_dead_letter(
-                event_id, subscription_id, now=now
+            # 当代死信（按 seq 升序）
+            current_records = self._storage.list_dead_letters(
+                tenant_id=tenant_id, subscription_id=subscription_id
             )
-            results.append({"event_id": event_id, "outcome": outcome.value})
-            key = outcome.value.lower()
-            if key in counts:
-                counts[key] += 1
+            current_ids = [r.event_id for r in current_records]
 
-        for event_id in claimed:
-            results.append({
-                "event_id": event_id,
-                "outcome": ReplayOutcome.ALREADY_REPLAYING.value,
-            })
-            counts["already_replaying"] += 1
+            # 上代候选（受冷却窗约束）：仅用于让重复批次对已离开失败链路的
+            # 事件仍能逐条回带稳定结论。
+            prior_ids: list[str] = []
+            if cooldown_seconds != 0:
+                last = self._batch_last.get(subscription_id)
+                if last is not None:
+                    last_ids, last_at = last
+                    if (
+                        cooldown_seconds is None
+                        or (now - last_at).total_seconds() <= cooldown_seconds
+                    ):
+                        prior_ids = list(last_ids)
 
-        # 纯落败批（当前已无死信，全部在上一代候选内）：把上一代候选逐条
-        # 回带为 ALREADY_REPLAYING，使并发两批 total 一致、结论一一对应。
-        if not results and recent_ids:
-            for event_id in recent_ids:
-                results.append({
-                    "event_id": event_id,
-                    "outcome": ReplayOutcome.ALREADY_REPLAYING.value,
-                })
-                counts["already_replaying"] += 1
+            # 候选 = 当代死信 ∪ 上代候选；按存储中的 seq 顺序稳定排列，
+            # 存储中已不存在的上代事件（NOT_FOUND）直接剔除。
+            candidate_ids = list(current_ids)
+            seen = set(current_ids)
+            for eid in prior_ids:
+                if eid in seen:
+                    continue
+                rec = await self._storage.get_delivery(eid, subscription_id)
+                if rec is None:
+                    continue  # 记录已不存在：无可报告对象，不计入 total
+                candidate_ids.append(eid)
+                seen.add(eid)
+            candidate_ids = await self._sorted_by_seq_locked(
+                candidate_ids, subscription_id
+            )
+
+            results: list[dict] = []
+            counts = {
+                "replayed": 0,
+                "already_replaying": 0,
+                "already_delivered": 0,
+                "not_dead_letter": 0,
+            }
+            for event_id in candidate_ids:
+                outcome, _ = await self._replay_claim_locked(
+                    event_id, subscription_id, now
+                )
+                if outcome is ReplayOutcome.NOT_FOUND:
+                    # 极端竞态下记录消失：无对应实体，不产生逐条结论
+                    continue
+                results.append({"event_id": event_id, "outcome": outcome.value})
+                key = outcome.value.lower()
+                if key in counts:
+                    counts[key] += 1
+
+            # 登记本代候选记忆（cooldown=0 表示不记忆）。以全部有结论候选
+            # 为准，使随后重复批次对「已成功 / 仍在投递 / 暂停积压」的事件
+            # 都能逐条回带，与失败链路查到的状态一致。
+            if cooldown_seconds != 0 and candidate_ids:
+                remembered = [
+                    r["event_id"] for r in results
+                ]
+                self._batch_last[subscription_id] = (remembered, now)
+            elif cooldown_seconds == 0:
+                self._batch_last.pop(subscription_id, None)
 
         logger.info(
             "replay_batch subscription_id=%s total=%s replayed=%s "
-            "already_replaying=%s",
+            "already_replaying=%s already_delivered=%s not_dead_letter=%s",
             subscription_id, len(results), counts["replayed"],
-            counts["already_replaying"],
+            counts["already_replaying"], counts["already_delivered"],
+            counts["not_dead_letter"],
         )
         return {
             "tenant_id": tenant_id,
@@ -294,6 +341,18 @@ class Dispatcher:
             **counts,
             "results": results,
         }
+
+    async def _sorted_by_seq_locked(
+        self, event_ids: list[str], subscription_id: str
+    ) -> list[str]:
+        """按投递记录 seq 升序排列候选；无记录的事件排到最后（稳定）。"""
+        keyed: list[tuple[int, int, str]] = []
+        for fallback, eid in enumerate(event_ids):
+            rec = await self._storage.get_delivery(eid, subscription_id)
+            seq = rec.seq if rec is not None else 10**12
+            keyed.append((seq, fallback, eid))
+        keyed.sort()
+        return [eid for _, _, eid in keyed]
 
     # 确定性驱动（测试与本地演示） ----------------------------------------
     async def run_pending(self, now=None) -> int:
@@ -324,8 +383,8 @@ class Dispatcher:
             subscription = await self._storage.get_subscription(sub_id)
             if subscription is None:
                 continue
-            await self._attempt_head(record, subscription, now)
-            processed += 1
+            if await self._attempt_head(record, subscription, now):
+                processed += 1
         return processed
 
     async def run_until_drained(
@@ -369,9 +428,58 @@ class Dispatcher:
     # 单次尝试 ------------------------------------------------------------
     async def _attempt_head(
         self, record: DeliveryRecord, subscription: Subscription, now=None
-    ) -> None:
+    ) -> bool:
+        """推进一次队首投递。返回 True 表示本次真正尝试；并发落败/已终结
+        等跳过情形返回 False（不产生任何实际发送）。"""
         lock = await self._storage.subscription_lock(subscription.subscription_id)
         async with lock:
+            async with self._cond:
+                queue = self._queues.get(subscription.subscription_id)
+                head_marker = queue[0] if queue else None
+            # 并发推进防护（后台 worker 与手工 pump/另一路径同时到达时）：
+            # 1) 必须仍是队首（前序事件未终结前，后来者不得越过）；
+            # 2) 记录不得已终结——已成功/已死信的事件绝不允许再次发出；
+            # 3) 重新从存储读取当前状态，拒绝处理过期快照（另一路径可能
+            #    已经把它推进到 DELIVERING/RETRYING）。
+            marker = (record.event_id, record.subscription_id)
+            if head_marker != marker:
+                logger.info(
+                    "delivery_skip event_id=%s subscription_id=%s "
+                    "basis=NOT_HEAD head=%s",
+                    record.event_id, subscription.subscription_id, head_marker,
+                )
+                return False
+            fresh = await self._storage.get_delivery(
+                record.event_id, record.subscription_id
+            )
+            if fresh is None:
+                async with self._cond:
+                    if queue and queue[0] == marker:
+                        queue.popleft()
+                    self._cond.notify_all()
+                return False
+            if fresh.status in (EventStatus.DELIVERED, EventStatus.DEAD_LETTER):
+                # 已终结事件不能被再次拿出来发送：清理残留队头即可。
+                logger.info(
+                    "delivery_skip event_id=%s subscription_id=%s "
+                    "basis=TERMINAL status=%s",
+                    record.event_id, subscription.subscription_id, fresh.status.value,
+                )
+                async with self._cond:
+                    if queue and queue[0] == marker:
+                        queue.popleft()
+                    self._cond.notify_all()
+                return False
+            if fresh.status is EventStatus.DELIVERING:
+                # 另一路径正在发送同一事件：本次推进直接退出，绝不重复 POST。
+                logger.info(
+                    "delivery_skip event_id=%s subscription_id=%s "
+                    "basis=IN_FLIGHT",
+                    record.event_id, subscription.subscription_id,
+                )
+                return False
+            # 以存储中的最新记录为准继续（与 fresh 同一对象）
+            record = fresh
             await self._deliver_one(record, subscription, now)
             # 终结则出队，否则保留队首等待退避
             terminal = record.status in (EventStatus.DELIVERED, EventStatus.DEAD_LETTER)
@@ -381,6 +489,7 @@ class Dispatcher:
                     if queue and queue[0] == (record.event_id, record.subscription_id):
                         queue.popleft()
                     self._cond.notify_all()
+            return True
 
     async def _deliver_one(
         self, record: DeliveryRecord, subscription: Subscription, now=None

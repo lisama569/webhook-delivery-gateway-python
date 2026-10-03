@@ -67,15 +67,17 @@ class AppState:
             await self.storage.upsert_tenant(
                 Tenant("tenant-b", "合作方B（独立额度）", rate_limit_per_min=5)
             )
-            # tenant-a 的新旧凭据处于轮换重叠期
-            # 窗口向过去放宽，确保固定时钟（如测试 T0）也落在有效期内
+            # tenant-a 的新旧凭据处于轮换重叠期。
+            # 窗口以当前时刻为中心对称放宽（而不是窄窗口或偏置窗口），
+            # 这样任意本地验证时钟（含测试固定时钟 T0=2026-09-22）只要落在
+            # 以启动日为中心的宽限期内都可验签，种子行为不会随日历漂移。
             await self.storage.upsert_credential(
                 Credential(
                     key_id="key-a-old",
                     tenant_id="tenant-a",
                     secret="secret-old",
-                    not_before=now - timedelta(days=90),
-                    not_after=now + timedelta(days=1),
+                    not_before=now - timedelta(days=3650),
+                    not_after=now + timedelta(days=3650),
                     deprecated=True,
                 )
             )
@@ -84,18 +86,20 @@ class AppState:
                     key_id="key-a-new",
                     tenant_id="tenant-a",
                     secret="secret-new",
-                    not_before=now - timedelta(days=10),
-                    not_after=now + timedelta(days=29),
+                    not_before=now - timedelta(days=3650),
+                    not_after=now + timedelta(days=3650),
                 )
             )
-            # 已过期凭据：必须被明确拒绝（not_after 早于任何本地验证时钟）
+            # 已过期凭据：必须被明确拒绝。not_after 严格早于任意可能的本地
+            # 验证时钟（固定时钟测试 T0 与真实当前时刻），并留足余量避免
+            # 随日历漂移。
             await self.storage.upsert_credential(
                 Credential(
                     key_id="key-a-expired",
                     tenant_id="tenant-a",
                     secret="secret-expired",
-                    not_before=now - timedelta(days=70),
-                    not_after=now - timedelta(days=10),
+                    not_before=now - timedelta(days=7200),
+                    not_after=now - timedelta(days=3650),
                 )
             )
             await self.storage.upsert_credential(
@@ -103,8 +107,8 @@ class AppState:
                     key_id="key-b-1",
                     tenant_id="tenant-b",
                     secret="secret-b",
-                    not_before=now - timedelta(days=10),
-                    not_after=now + timedelta(days=30),
+                    not_before=now - timedelta(days=3650),
+                    not_after=now + timedelta(days=3650),
                 )
             )
             # 契约：order.created v1（v1.2 为注册版本，向前兼容到 1.x）
